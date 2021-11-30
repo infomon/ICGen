@@ -2,14 +2,17 @@ import json
 import logging
 import math
 import random
-
+from typing import Optional
 from collections import defaultdict
 from pathlib import Path
+import more_itertools
+import pickle
 
 import tensorflow_datasets as tfds
 
 from icgen.dataset_names import DATASETS as _DATASETS
-
+import numpy as np
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
@@ -130,7 +133,7 @@ def _dataset_to_augmented_identifier(
     return identifier
 
 
-def _dataset_to_identifier(dataset, dataset_info):
+def _dataset_to_identifier(dataset, dataset_info, test_ratio: float = 0.1):
     identifier = dict()
 
     identifier["dataset"] = dataset
@@ -143,7 +146,8 @@ def _dataset_to_identifier(dataset, dataset_info):
     total_examples = dataset_info["num_examples"]
 
     test_per_class = min(class_examples for class_examples in examples_per_class) // 2
-    test_per_class = min(test_per_class, total_examples // (num_classes * 10))
+    test_per_class = min(test_per_class,
+                         math.floor((total_examples // num_classes) * test_ratio))
     identifier["class_to_test_samples"] = {
         class_: set(range(test_per_class)) for class_ in range(num_classes)
     }
@@ -205,7 +209,7 @@ def _load_dataset(dataset_key, data_path, info_path, download=False):
         split=None,  # return as dict: split_name -> valid_ratio
         data_dir=data_path,
         batch_size=None,  # return full datasets as tensors
-        in_memory=False,
+        # in_memory=False,
         shuffle_files=False,
         download=download,
         as_supervised=True,
@@ -294,3 +298,138 @@ class ICDatasetGenerator:
             dataset=dataset, datasets=datasets, augment=augment
         )
         return self.identifier_to_dataset(identifier, download=download)
+
+
+def _get_valid_split(dev_split: list, info: dict, valid_fraction: float = 0.0) -> dict:
+    """ Given an info dict for any dataset and its dev_split, performs the same splitting
+    operation as for splitting the whole dataset into a dev/test split but it treats the
+    given dev_split as the whole dataset. Useful for further splitting the dev_split into
+    a training and a validation split. Returns the new training and validation splits as
+    well as an info dict pertains to the input dev_split only, i.e. contains statistical
+    info about the dev_split. """
+
+    new_info = dict(info)
+    new_info["num_examples"] = len(dev_split)
+
+    ## Calculate new examples per class
+    class_to_count = defaultdict(int)
+
+    for image, label in dev_split:
+        class_ = int(label)
+        class_to_count[class_] += 1
+
+    new_info["examples_per_class"] = \
+        [class_to_count[class_] for class_ in sorted(class_to_count.keys())]
+    valid_split_identifier = _dataset_to_identifier(
+        dataset=new_info["name"], dataset_info=new_info, test_ratio=valid_fraction
+    )
+
+    # Generate only the indices for the training/validation splits
+    train_split, valid_split = [], []
+    class_to_count = defaultdict(int)
+
+    # TODO: Can this be integrated with the loop above?
+    for idx, (image, label) in enumerate(dev_split):
+        class_ = int(label)
+        image_id = class_to_count[class_]
+        class_to_count[class_] += 1
+
+        is_train_image = image_id in valid_split_identifier["class_to_dev_samples"][class_]
+        is_test_image = image_id in valid_split_identifier["class_to_test_samples"][class_]
+        if is_train_image:
+            train_split.append(idx)
+        elif is_test_image:
+            valid_split.append(idx)
+
+        # TODO: Include pixel statistic calculation here
+
+    # train_split, valid_split = _identifier_to_data(valid_split_identifier, dev_split)
+    return train_split, valid_split, new_info
+
+
+def save_dataset(dev_split: list, test_split: list, info: dict, save_path: Path,
+                 valid_fraction: float = 0.0, chunk_size: Optional[int] = None, new_max_dim=None):
+    """
+    Save a dataset in a torchvision-compatible format. Still quite rudimentary, intended
+    for use with raw datasets only and not augmented versions.
+
+    :param dev_split: list of 2-tuples
+        The raw data to be chunked and saved. A list of 2-tuples containing a numpy-array
+        and a class label. This can be further split into a training and a validation
+        split, see 'valid_fraction'.
+    :param test_split: list of 2-tuples
+        The raw data to be chunked and saved. A list of 2-tuples containing a numpy-array
+        and a class label.
+    :param info: dict
+        The dataset's info dict
+    :param save_path: Path-like
+        Path to the directory where the dataset is to be saved. It is recommended that
+        this be different from the directory where the original dataset and splits were
+        downloaded and saved by ICGen.
+    :param valid_fraction: float
+        Fraction of the training split to be further split off into a validation set. If
+        0.0 (default), no validation split is generated.
+    :param chunk_size: None or int
+        Size in MB of each chunk. When None (default), all data is saved into a single
+        file. This eases up memory usage during both saving and loading. # TODO: Implement
+    :return: None
+    """
+
+    new_info = dict(info)
+    if new_max_dim is not None and new_max_dim != dict(info)["max_dim"]:
+        new_info['name'] = f"{new_info['name']}_{new_max_dim}"
+    outdir = save_path / f"{new_info['name']}"
+    outdir.mkdir(exist_ok=True)
+    new_info["splits"] = []
+
+    splits = {"train": dev_split, "test": test_split}
+    train_info = None
+
+    if valid_fraction > 0.0:
+        train_split, valid_split, train_info = \
+            _get_valid_split(dev_split, info, valid_fraction)
+        validation_split_dict = {
+            "train": ['int', train_split],
+            "valid": ['int', valid_split]
+        }
+
+    for k, v in splits.items():
+        images, labels = more_itertools.unzip(v)
+        if new_max_dim is not None and new_info["max_dim"] != new_max_dim:
+            images = transform(images=images, size=new_max_dim)
+            if k == "train":
+                new_info["max_x_dim"] = new_max_dim
+                new_info["max_y_dim"] = new_max_dim
+                new_info["min_x_dim"] = new_max_dim
+                new_info["min_y_dim"] = new_max_dim
+                new_info["min_dim"] = new_max_dim
+                new_info["mean_x_dim"] = new_max_dim
+                new_info["mean_y_dim"] = new_max_dim
+                new_info["mean_dim"] = new_max_dim
+                new_info["min_pixel_value"] = float(np.min(images))
+                new_info["max_pixel_value"] = float(np.max(images))
+                new_info["mean_pixel_value"] = float(np.mean(images))
+                new_info["mean_std_pixel_value"] = float(np.std(images))
+                new_info["mean_pixel_value_per_channel"] = list(np.mean(images, axis=(0,1,2)))
+                new_info["mean_std_pixel_value_per_channel"] = list(np.std(images, axis=(0,1,2)))
+        with open(outdir / f"{k}-split", "wb") as fp:
+            pickle.dump({"images": list(images), "labels": list(labels)}, fp)
+        new_info["splits"].append(k)
+
+    if train_info is not None:
+        if new_max_dim is not None and new_info["max_dim"] != new_max_dim:
+            new_info["max_dim"] = new_max_dim
+        new_info["train_info"] = train_info
+        with open(outdir / f"validation-split.json", "w") as fp:
+            json.dump(validation_split_dict, fp)
+
+    with open(outdir / "info.json", "w") as fp:
+        json.dump(new_info, fp)
+
+def transform(images, size=256):
+    ret_images = []
+    for img in images:
+        img = Image.fromarray(img)
+        img = img.resize((size, size))
+        ret_images.append(np.array(img))
+    return ret_images
